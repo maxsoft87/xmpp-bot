@@ -168,7 +168,7 @@ sudo systemctl start xmpp-bot
 pip install slixmpp slixmpp_omemo omemo cryptography xeddsa
 python send_xmpp.py --listen
 ```
-P.S. Build on Nuitka
+ P.S. Build on Nuitka
 ---
 
 ## CLI Arguments
