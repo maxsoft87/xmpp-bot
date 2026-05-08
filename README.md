@@ -202,7 +202,6 @@ python send_xmpp.py --listen
 
 Version is embedded at build time:
 ```bash
-./build.sh 1.0.0    # compiles with version 1.0.0
 xmpp_bot --version  # shows version
 /status             # shows version in XMPP
 ```
