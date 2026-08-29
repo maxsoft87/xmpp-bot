@@ -1,7 +1,7 @@
 # XMPP Bot - Feature Overview
 
 ## General Description
-XMPP/Jabber bot with OMEMO end-to-end encryption support, a flexible command system from configuration files, group-based access control, and hot configuration reload.
+XMPP/Jabber bot with OMEMO end-to-end encryption support, a flexible command system from configuration files, group-based access control, and hot configuration reload. Works in one-to-one chats and in OMEMO-encrypted group rooms (MUC).
 
 ---
 
@@ -12,6 +12,12 @@ Runs as a daemon, connects to XMPP server, and waits for incoming messages.
 ```bash
 xmpp_bot --listen
 xmpp_bot --listen --debug
+```
+
+Rooms from `config.json` are joined automatically, or can be given on the command line:
+```bash
+xmpp_bot --listen --room ops@conference.example.com --nick botty
+xmpp_bot --listen --room ops@conference.example.com --room alerts@conference.example.com
 ```
 
 ### 2. Single Message Mode
@@ -36,7 +42,19 @@ xmpp_bot -j robot@example.com -p password -t user@example.com -s < image.jpg
 - Automatic end-to-end encryption for all messages
 - Trust management via automatic trust on first use (BTBV)
 - Device list management and session handling
-- Graceful fallback to unencrypted messages if OMEMO unavailable
+- Device list publication verified against PEP at startup
+- Graceful fallback to unencrypted messages in one-to-one chats if OMEMO unavailable
+- No plaintext fallback in group rooms — a group reply is either encrypted for every recipient or not sent at all
+
+### 💬 Group Rooms (MUC, XEP-0045)
+- Joins configured rooms after OMEMO keys are published
+- Commands work in rooms exactly as in private chat; access control is applied to the sender's real JID
+- Replies encrypted for all affiliated room members
+- Join history suppressed, so stored commands are not replayed on reconnect
+- Separate auto-reply for rooms with `{nick}`, `{jid}` and `{room}` placeholders
+- Joined rooms and nicknames shown in `/status`
+
+> **Note:** the bot needs to read the room affiliation lists to build the recipient set. If it cannot, group replies are skipped rather than sent unencrypted. Commands without `groups_only` are callable by any occupant, and their output goes to the whole room — review your access rules before joining shared rooms.
 
 ### 📁 Centralized Configuration
 All configuration files located in `/etc/xmpp_bot/`:
@@ -122,9 +140,35 @@ Define custom commands in `commands.json`:
   "auto_reply": null,
   "omemo_enabled": true,
   "omemo_device_id": null,
+  "muc_rooms": [],
+  "muc_nick": null,
+  "muc_password": null,
+  "muc_auto_reply": null,
   "log_level": "INFO"
 }
 ```
+
+### MUC rooms
+`muc_rooms` accepts plain JIDs, or objects with a per-room nickname and password:
+```json
+{
+  "muc_rooms": [
+    "alerts@conference.example.com",
+    {
+      "jid": "ops@conference.example.com",
+      "nick": "opsbot",
+      "password": "roomsecret"
+    }
+  ],
+  "muc_nick": "botty",
+  "muc_password": null,
+  "muc_auto_reply": "Hi {nick}, use /help for the command list"
+}
+```
+
+- `muc_nick` — default nickname for rooms that don't set their own (falls back to the account localpart)
+- `muc_password` — default password for password-protected rooms
+- `muc_auto_reply` — reply to non-command messages in rooms; supports `{nick}`, `{jid}` and `{room}`. Leave `null` to stay silent.
 
 ### commands.json
 ```json
@@ -149,26 +193,41 @@ Define custom commands in `commands.json`:
 
 ## Installation
 
+Packages and the standalone binary are published on the
+[Releases page](https://github.com/maxsoft87/xmpp-bot/releases).
+
 ### From DEB package
 ```bash
-sudo dpkg -i xmpp-bot_1.0.0_amd64.deb
+sudo dpkg -i xmpp-bot_8.0.1_amd64.deb
 sudo nano /etc/xmpp_bot/config.json
 sudo systemctl start xmpp-bot
 ```
 
 ### From RPM package
 ```bash
-sudo rpm -ivh xmpp-bot-1.0.0-1.x86_64.rpm
+sudo rpm -ivh xmpp-bot-8.0.1-1.x86_64.rpm
 sudo nano /etc/xmpp_bot/config.json
 sudo systemctl start xmpp-bot
 ```
 
 ### From source
 ```bash
-pip install slixmpp slixmpp_omemo omemo cryptography xeddsa
+pip install slixmpp slixmpp_omemo omemo cryptography xeddsa aiohttp aiodns
 python send_xmpp.py --listen
 ```
-- P.S. Build on Nuitka
+
+### Building a standalone binary
+The binary is compiled with Nuitka in onefile mode:
+```bash
+./build.sh 8.0.1          # build, verify and deploy
+DEPLOY=0 ./build.sh 8.0.1 # build and verify only
+```
+If `/tmp` on the target host is mounted `noexec`, build with a writable
+extraction directory:
+```bash
+ONEFILE_TEMPDIR='{CACHE_DIR}/xmpp_bot/{VERSION}' ./build.sh 8.0.1
+```
+
 ---
 
 ## CLI Arguments
@@ -182,10 +241,17 @@ python send_xmpp.py --listen
 | `-i, --image` | Image file path |
 | `-b, --base64` | Base64 image string |
 | `--listen` | Daemon mode |
+| `--auto-reply` | Auto-reply text for private chats |
+| `--room` | MUC room JID to join (repeat for several rooms) |
+| `--nick` | MUC nickname (defaults to the account localpart) |
+| `--room-password` | Password for rooms given on the command line |
+| `--muc-auto-reply` | Room auto-reply; supports `{nick}`, `{jid}`, `{room}` |
 | `-N, --no-omemo` | Disable OMEMO |
 | `-c, --config` | Commands config path |
 | `-d, --debug` | Debug logging |
 | `-v, --version` | Show version |
+
+`--room` replaces the `muc_rooms` list from `config.json` when given.
 
 ---
 
@@ -205,3 +271,13 @@ Version is embedded at build time:
 xmpp_bot --version  # shows version
 /status             # shows version in XMPP
 ```
+
+---
+
+## Credits
+
+OMEMO multi-user chat support contributed by [@1kamma](https://github.com/1kamma).
+
+Built with [slixmpp](https://github.com/poezio/slixmpp),
+[slixmpp-omemo](https://codeberg.org/poezio/slixmpp-omemo) and
+[python-omemo](https://github.com/Syndace/python-omemo).
