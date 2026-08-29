@@ -10,7 +10,7 @@ from slixmpp_omemo import XEP_0384, TrustLevel
 from omemo.storage import Storage, Just, Nothing
 
 # Build version
-__version__ = "7.0.0"
+__version__ = "8.0.1"
 
 # === Centralized configuration ===
 CONFIG_DIR = "/etc/xmpp_bot"
@@ -29,6 +29,10 @@ DEFAULT_MAIN_CONFIG = {
     "auto_reply": None,
     "omemo_enabled": True,
     "omemo_device_id": None,
+    "muc_rooms": [],
+    "muc_nick": None,
+    "muc_password": None,
+    "muc_auto_reply": None,
     "log_level": "INFO"
 }
 
@@ -436,7 +440,10 @@ class CommandHandler:
 
 
 class JabberSender(ClientXMPP):
-    def __init__(self, jid, pwd, omemo, storage_path, storage, commands_config_path, main_config_path, scripts_dir, auto_reply_text=None, interactive=False, omemo_device_id=None):
+    def __init__(self, jid, pwd, omemo, storage_path, storage, commands_config_path,
+                 main_config_path, scripts_dir, auto_reply_text=None,
+                 interactive=False, omemo_device_id=None, muc_rooms=None,
+                 muc_nick=None, muc_password=None, muc_auto_reply=None):
         super().__init__(jid, pwd)
         self.use_omemo = omemo
         self.storage_path = storage_path
@@ -449,6 +456,12 @@ class JabberSender(ClientXMPP):
         self.active_chat = None
         self.start_time = datetime.now()
         self.omemo_device_id = omemo_device_id
+        self.muc_rooms = self._normalize_muc_rooms(
+            muc_rooms or [], muc_nick or JID(jid).user, muc_password
+        )
+        self.muc_auto_reply = muc_auto_reply
+        self.active_omemo_device_id = None
+        self._not_for_us_warned = set()
         self.startup_params = {
             'jid': jid, 'password': pwd, 'omemo_enabled': omemo,
             'omemo_device_id': omemo_device_id, 'storage_file': storage_path,
@@ -460,8 +473,35 @@ class JabberSender(ClientXMPP):
         self.shutdown_event = asyncio.Event()
         self.add_event_handler("session_start", self._start)
         self.add_event_handler("message", self._on_message)
+        self.add_event_handler("groupchat_message", self._on_muc_message)
         self.add_event_handler("failed_auth", self._on_failed_auth)
         self.add_event_handler("disconnected", self._on_disconnected)
+
+    @staticmethod
+    def _normalize_muc_rooms(rooms, default_nick, default_password=None):
+        """Accept room JIDs or per-room dictionaries from config/CLI."""
+        if isinstance(rooms, (str, dict)):
+            rooms = [rooms]
+        normalized = []
+        for entry in rooms:
+            if isinstance(entry, str):
+                room = entry
+                nick = default_nick
+                password = default_password
+            elif isinstance(entry, dict):
+                room = entry.get('jid') or entry.get('room')
+                nick = entry.get('nick') or default_nick
+                password = entry.get('password', default_password)
+            else:
+                logging.warning(f"Ignoring invalid MUC entry: {entry!r}")
+                continue
+            if room and nick:
+                normalized.append({
+                    'jid': JID(room).bare,
+                    'nick': nick,
+                    'password': password
+                })
+        return normalized
 
     def get_status_text(self) -> str:
         status_lines = [f"📊 Bot Status v{__version__}", ""]
@@ -471,7 +511,12 @@ class JabberSender(ClientXMPP):
         status_lines.append(f"  OMEMO: {'✅ Enabled' if self.use_omemo else '❌ Disabled'}")
         if self.startup_params['omemo_device_id']:
             status_lines.append(f"  OMEMO Device ID: {self.startup_params['omemo_device_id']}")
+        if self.active_omemo_device_id is not None:
+            status_lines.append(f"  Active OMEMO Device ID: {self.active_omemo_device_id}")
         status_lines.append(f"  Connected: {'✅ Yes' if self.is_connected() else '❌ No'}")
+        status_lines.append(f"  MUC rooms: {len(self.muc_rooms)}")
+        for room in self.muc_rooms:
+            status_lines.append(f"    {room['jid']} as {room['nick']}")
         status_lines.append("")
         status_lines.append("⏱️ Uptime:")
         status_lines.append(f"  Started: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -526,22 +571,157 @@ class JabberSender(ClientXMPP):
     async def _omemo_init(self):
         if self.omemo:
             await self.omemo.session_bind(self.boundjid.bare)
+            # session_bind/get_session_manager initialize the local device and
+            # publish its device list and bundle through PEP (XEP-0060/0163).
+            session_manager = await self.omemo.get_session_manager()
+            if hasattr(session_manager, 'get_own_device_information'):
+                try:
+                    own_device, _ = await session_manager.get_own_device_information()
+                    self.active_omemo_device_id = getattr(own_device, 'device_id', None)
+                except Exception as e:
+                    logging.warning(f"Could not inspect own OMEMO device: {e}")
             if hasattr(self.omemo.plugin, 'announce_support'):
                 try:
                     await self.omemo.plugin.announce_support()
-                except:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Could not announce OMEMO support: {e}")
+            self.storage.save_sync(self.storage_path)
+            published_ids = await self._get_published_omemo_device_ids()
+            device_text = (
+                f" (device {self.active_omemo_device_id})"
+                if self.active_omemo_device_id is not None else ""
+            )
+            publication_verified = (
+                self.active_omemo_device_id is not None
+                and self.active_omemo_device_id in published_ids
+            )
+            if publication_verified:
+                logging.info(
+                    f"OMEMO device keys initialized; publication verified{device_text}"
+                )
+            else:
+                logging.warning(
+                    f"OMEMO keys initialized{device_text}, but publication could "
+                    "not yet be verified in the account's device lists"
+                )
 
-    def _start(self, e):
+    async def _get_published_omemo_device_ids(self):
+        """Read back our PEP device nodes to confirm key advertisement."""
+        device_ids = set()
+        nodes = (
+            'urn:xmpp:omemo:2:devices',
+            'eu.siacs.conversations.axolotl.devicelist'
+        )
+        for node in nodes:
+            iq = self.Iq()
+            iq['type'] = 'get'
+            iq['to'] = self.boundjid.bare
+            iq['pubsub']['items']['node'] = node
+            try:
+                response = await iq.send(timeout=10)
+                for device in response['pubsub']['items'].xml.findall('.//{*}device'):
+                    device_id = device.get('id')
+                    if device_id is not None:
+                        device_ids.add(int(device_id))
+            except Exception as e:
+                logging.debug(f"Could not read OMEMO device node {node}: {e}")
+        logging.info(f"Published OMEMO device IDs: {sorted(device_ids)}")
+        return device_ids
+
+    def _skip_message_not_for_us(self, source):
+        """Log once when a peer did not encrypt a stanza for this device."""
+        key = str(source)
+        if key not in self._not_for_us_warned:
+            self._not_for_us_warned.add(key)
+            device_text = (
+                f" device {self.active_omemo_device_id}"
+                if self.active_omemo_device_id is not None else " this device"
+            )
+            logging.warning(
+                f"Skipping OMEMO message from {source}: it was not encrypted "
+                f"for{device_text}. Ask the sending client to refresh the "
+                "recipient device list and send a new message."
+            )
+        else:
+            logging.debug(f"Skipping another OMEMO message not addressed to us: {source}")
+
+    async def _start(self, e):
         self.send_presence()
-        self.get_roster()
+        await self.get_roster()
         if self.use_omemo and self.omemo:
-            asyncio.ensure_future(self._omemo_init())
+            await self._omemo_init()
+        await self._join_muc_rooms()
         if self.interactive:
             print(f"\n✅ Connected as {self.boundjid}")
             print(f"   Version: {__version__}")
             print("Waiting for messages... (Ctrl+C to exit)")
             print("Available commands: /help, /ping and others from config")
+
+    async def _join_muc_rooms(self):
+        """Join configured rooms after OMEMO keys have been published."""
+        if not self.muc_rooms:
+            return
+        muc = self.plugin['xep_0045']
+        for room in self.muc_rooms:
+            try:
+                if hasattr(muc, 'join_muc_wait'):
+                    await muc.join_muc_wait(
+                        JID(room['jid']), room['nick'],
+                        password=room['password'], maxstanzas=0
+                    )
+                else:
+                    await muc.join_muc(
+                        room['jid'], room['nick'], maxhistory='0',
+                        password=room['password'] or ''
+                    )
+                logging.info(f"Joined MUC {room['jid']} as {room['nick']}")
+            except Exception as e:
+                logging.error(f"Could not join MUC {room['jid']}: {type(e).__name__}: {e}")
+
+    def _muc_config(self, room_jid):
+        room_bare = JID(room_jid).bare
+        return next((room for room in self.muc_rooms if room['jid'] == room_bare), None)
+
+    def _on_muc_message(self, msg):
+        room = msg['from'].bare
+        room_config = self._muc_config(room)
+        if not room_config or msg['mucnick'] == room_config['nick']:
+            return
+        if not self.omemo or not self.omemo.is_encrypted(msg):
+            return
+        asyncio.ensure_future(self._handle_muc_encrypted_message(msg, room))
+
+    async def _handle_muc_encrypted_message(self, msg, room):
+        """Decrypt an OMEMO groupchat message and answer in the same room."""
+        try:
+            decrypted, device = await self.omemo.decrypt_message(msg)
+            body = decrypted.get('body', '') if hasattr(decrypted, 'get') else ''
+            if not body:
+                return
+            sender_jid = self.plugin['xep_0045'].get_jid_property(
+                JID(room), msg['mucnick'], 'jid'
+            )
+            if not sender_jid and device is not None:
+                sender_jid = getattr(device, 'bare_jid', None) or getattr(device, 'jid', None)
+            if not sender_jid:
+                logging.error(
+                    f"Cannot reply securely in anonymous MUC {room}: "
+                    f"real JID for {msg['mucnick']} is unavailable"
+                )
+                return
+            await self._process_message(
+                JID(sender_jid).bare, body,
+                muc_room=room, muc_nick=msg['mucnick']
+            )
+        except Exception as e:
+            if type(e).__name__ == 'MessageNotForUs':
+                self._skip_message_not_for_us(room)
+                return
+            logging.error(
+                f"OMEMO MUC decryption error in {room}: {type(e).__name__}: {e}"
+            )
+            if logging.getLogger().level <= logging.DEBUG:
+                traceback.print_exc()
 
     def _on_message(self, msg):
         if msg['type'] not in ('chat', 'normal'):
@@ -600,12 +780,16 @@ class JabberSender(ClientXMPP):
             else:
                 logging.warning(f"Could not extract message body from {sender}")
         except Exception as e:
+            if type(e).__name__ == 'MessageNotForUs':
+                self._skip_message_not_for_us(sender)
+                return
             logging.error(f"OMEMO decryption error from {sender}: {type(e).__name__}: {e}")
             if logging.getLogger().level <= logging.DEBUG:
                 traceback.print_exc()
 
-    async def _process_message(self, sender, body):
-        print(f"\n📩 {sender}: {body}")
+    async def _process_message(self, sender, body, muc_room=None, muc_nick=None):
+        source = f"{muc_room}/{muc_nick} ({sender})" if muc_room else sender
+        print(f"\n📩 {source}: {body}")
         user_groups = self.command_handler.get_user_groups(sender)
         if user_groups:
             logging.debug(f"User {sender} groups: {', '.join(sorted(user_groups))}")
@@ -636,10 +820,23 @@ class JabberSender(ClientXMPP):
                     traceback.print_exc()
                 response = "❌ Execution error (code 2)"
             if response:
-                await self.send_text(sender, response)
+                if muc_room:
+                    await self.send_muc_omemo(muc_room, response)
+                else:
+                    await self.send_text(sender, response)
                 log_response = response[:100] + "..." if len(response) > 100 else response
-                print(f"🤖 Reply to {sender}: {log_response}")
-        elif self.auto_reply:
+                print(f"🤖 Reply to {source}: {log_response}")
+        elif muc_room and self.muc_auto_reply:
+            try:
+                reply = self.muc_auto_reply.format(
+                    nick=muc_nick, jid=sender, room=muc_room
+                )
+            except (KeyError, ValueError) as e:
+                logging.error(f"Invalid muc_auto_reply template: {e}")
+                return
+            await asyncio.sleep(1)
+            await self.send_muc_omemo(muc_room, reply)
+        elif not muc_room and self.auto_reply:
             await self._auto_reply(sender)
 
     async def _auto_reply(self, to):
@@ -726,6 +923,57 @@ class JabberSender(ClientXMPP):
             self.shutdown_event.set()
             if self.is_connected():
                 self.disconnect()
+
+    async def _muc_recipients(self, room):
+        """Return every affiliated real JID required by OMEMO MUC."""
+        muc = self.plugin['xep_0045']
+        recipients = {JID(self.boundjid.bare)}
+        for affiliation in ('member', 'admin', 'owner'):
+            try:
+                affiliated = await muc.get_affiliation_list(JID(room), affiliation)
+            except Exception as e:
+                logging.error(
+                    f"Cannot obtain {affiliation} list for {room}; refusing to "
+                    f"send an incomplete OMEMO group message: {e}"
+                )
+                return set()
+            for jid in affiliated or []:
+                if isinstance(jid, dict):
+                    jid = jid.get('jid')
+                if jid:
+                    recipients.add(JID(jid).bare)
+        return {JID(jid) for jid in recipients}
+
+    async def send_muc_omemo(self, room, body):
+        """Encrypt one groupchat stanza for all room members and send it."""
+        if not self.use_omemo or not self.omemo:
+            logging.error(f"Refusing plaintext fallback for OMEMO MUC {room}")
+            return False
+        recipients = await self._muc_recipients(room)
+        if not recipients:
+            return False
+        try:
+            if hasattr(self.omemo.plugin, 'refresh_device_lists'):
+                await self.omemo.plugin.refresh_device_lists(
+                    recipients, force_download=True
+                )
+            msg = self.make_message(mto=room, mbody=body, mtype='groupchat')
+            result = await self.omemo.encrypt_message(msg, recipients)
+            encrypted = result[0] if isinstance(result, tuple) else result
+            errors = result[1] if isinstance(result, tuple) and len(result) > 1 else set()
+            if errors:
+                logging.warning(f"Non-fatal OMEMO MUC encryption errors: {errors}")
+            if encrypted is None:
+                logging.error(f"OMEMO produced no group message for {room}")
+                return False
+            encrypted.send()
+            print(f"🔐 OMEMO MUC → {room}: {body[:50]}...")
+            return True
+        except Exception as e:
+            logging.error(f"OMEMO MUC send error to {room}: {type(e).__name__}: {e}")
+            if logging.getLogger().level <= logging.DEBUG:
+                traceback.print_exc()
+            return False
 
     async def send_omemo(self, to, body):
         if not self.omemo:
@@ -880,6 +1128,14 @@ async def main():
     p.add_argument('-N', '--no-omemo', action='store_true', help='Disable OMEMO')
     p.add_argument('--listen', action='store_true', help='Listen mode')
     p.add_argument('--auto-reply', nargs='?', const=False, default=main_config.get('auto_reply'), help='Auto-reply text')
+    p.add_argument('--room', action='append', dest='muc_rooms', default=None,
+                   help='MUC room JID to join (repeat for multiple rooms)')
+    p.add_argument('--nick', dest='muc_nick', default=main_config.get('muc_nick'),
+                   help='MUC nickname (defaults to the account localpart)')
+    p.add_argument('--room-password', default=main_config.get('muc_password'),
+                   help='Password for CLI-specified MUC rooms')
+    p.add_argument('--muc-auto-reply', default=main_config.get('muc_auto_reply'),
+                   help='OMEMO MUC auto-reply; supports {nick}, {jid}, and {room}')
     p.add_argument('-c', '--config', default=main_config.get('commands_config', CONFIG_FILE_BOT), help='Commands config path')
     p.add_argument('-d', '--debug', action='store_true', help='Debug mode')
     args = p.parse_args()
@@ -907,6 +1163,7 @@ async def main():
     storage_file = main_config.get('storage_file', STORAGE_FILE)
     commands_config_file = args.config
     scripts_dir = main_config.get('scripts_dir', SCRIPTS_DIR)
+    muc_rooms = args.muc_rooms if args.muc_rooms is not None else main_config.get('muc_rooms', [])
 
     storage = DictStorage()
     if use_omemo:
@@ -920,10 +1177,15 @@ async def main():
         scripts_dir=scripts_dir,
         auto_reply_text=auto_reply_text,
         interactive=is_interactive,
-        omemo_device_id=args.omemo_device
+        omemo_device_id=args.omemo_device,
+        muc_rooms=muc_rooms,
+        muc_nick=args.muc_nick,
+        muc_password=args.room_password,
+        muc_auto_reply=args.muc_auto_reply
     )
 
     x.register_plugin('xep_0030')
+    x.register_plugin('xep_0045')
     x.register_plugin('xep_0199')
     x.register_plugin('xep_0363')
     x.register_plugin('xep_0066')
@@ -933,10 +1195,12 @@ async def main():
         try:
             if 'xep_0060' not in x.plugin:
                 x.register_plugin('xep_0060')
+            for dependency in ('xep_0004', 'xep_0163', 'xep_0280'):
+                if dependency not in x.plugin:
+                    x.register_plugin(dependency)
             _storage = storage
             class PatchedXEP0384(XEP_0384):
                 name = 'xep_0384'
-                dependencies = {'xep_0060'}
                 @property
                 def storage(self):
                     return _storage
